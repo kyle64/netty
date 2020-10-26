@@ -108,10 +108,10 @@ public class IdleStateHandler extends ChannelDuplexHandler {
         }
     };
 
-    private final boolean observeOutput;
-    private final long readerIdleTimeNanos;
-    private final long writerIdleTimeNanos;
-    private final long allIdleTimeNanos;
+    private final boolean observeOutput; // 是否考虑出站时较慢的情况。默认值是false（不考虑）
+    private final long readerIdleTimeNanos; // 读事件空闲时间，0 则禁用事件
+    private final long writerIdleTimeNanos; // 写事件空闲时间，0 则禁用事件
+    private final long allIdleTimeNanos; // 读或写空闲时间，0 则禁用事件
 
     private ScheduledFuture<?> readerIdleTimeout;
     private long lastReadTime;
@@ -305,6 +305,7 @@ public class IdleStateHandler extends ChannelDuplexHandler {
         }
     }
 
+    // 当该 handler 被添加到 pipeline 中时，则调用 initialize 方法：
     private void initialize(ChannelHandlerContext ctx) {
         // Avoid the case where destroy() is called before scheduling timeouts.
         // See: https://github.com/netty/netty/issues/143
@@ -319,6 +320,7 @@ public class IdleStateHandler extends ChannelDuplexHandler {
 
         lastReadTime = lastWriteTime = ticksInNanos();
         if (readerIdleTimeNanos > 0) {
+            // 这里的 schedule 方法会调用 eventLoop 的 schedule 方法，将定时任务添加进队列中
             readerIdleTimeout = schedule(ctx, new ReaderIdleTimeoutTask(ctx),
                     readerIdleTimeNanos, TimeUnit.NANOSECONDS);
         }
@@ -396,6 +398,7 @@ public class IdleStateHandler extends ChannelDuplexHandler {
             Unsafe unsafe = channel.unsafe();
             ChannelOutboundBuffer buf = unsafe.outboundBuffer();
 
+            // 记录了出站缓冲区相关的数据，buf 对象的 hash 码，和 buf 的剩余缓冲字节数
             if (buf != null) {
                 lastMessageHashCode = System.identityHashCode(buf.current());
                 lastPendingWriteBytes = buf.totalPendingWriteBytes();
@@ -419,6 +422,7 @@ public class IdleStateHandler extends ChannelDuplexHandler {
             // that there's change happening on byte level. If the user doesn't observe channel
             // writability events then they'll eventually OOME and there's clearly a different
             // problem and idleness is least of their concerns.
+            // 如果最后一次写的时间和上一次记录的时间不一样，说明写操作进行过了，则更新此值
             if (lastChangeCheckTimeStamp != lastWriteTime) {
                 lastChangeCheckTimeStamp = lastWriteTime;
 
@@ -433,9 +437,11 @@ public class IdleStateHandler extends ChannelDuplexHandler {
             ChannelOutboundBuffer buf = unsafe.outboundBuffer();
 
             if (buf != null) {
+                // 拿到出站缓冲区的 对象 hashcode
                 int messageHashCode = System.identityHashCode(buf.current());
                 long pendingWriteBytes = buf.totalPendingWriteBytes();
 
+                // 如果和之前的不相等，或者字节数不同，说明，输出有变化，将 "最后一个缓冲区引用" 和 “剩余字节数” 更新
                 if (messageHashCode != lastMessageHashCode || pendingWriteBytes != lastPendingWriteBytes) {
                     lastMessageHashCode = messageHashCode;
                     lastPendingWriteBytes = pendingWriteBytes;
@@ -487,19 +493,28 @@ public class IdleStateHandler extends ChannelDuplexHandler {
 
         @Override
         protected void run(ChannelHandlerContext ctx) {
+            // 得到用户设置的超时时间。
             long nextDelay = readerIdleTimeNanos;
+            // 如果读取操作结束了（执行了 channelReadComplete 方法设置），
+            // 就用当前时间减去给定时间和最后一次读操作的时间（执行了 channelReadComplete 方法设置），
+            // 如果小于0，就触发事件。反之，继续放入队列。间隔时间是新的计算时间。
             if (!reading) {
                 nextDelay -= ticksInNanos() - lastReadTime;
             }
 
+            // 触发的逻辑是：首先将任务再次放到队列，时间是刚开始设置的时间，返回一个 promise 对象，用于做取消操作。
+            // 然后，设置 first 属性为 false ，表示，下一次读取不再是第一次了，这个属性在 channelRead 方法会被改成 true。
             if (nextDelay <= 0) {
                 // Reader is idle - set a new timeout and notify the callback.
+                // 用于取消任务 promise
                 readerIdleTimeout = schedule(ctx, this, readerIdleTimeNanos, TimeUnit.NANOSECONDS);
 
                 boolean first = firstReaderIdleEvent;
                 firstReaderIdleEvent = false;
 
+                // 创建一个 IdleStateEvent 类型的写事件对象，将此对象传递给用户的 UserEventTriggered 方法。完成触发事件的操作
                 try {
+                    // 再次提交任务
                     IdleStateEvent event = newIdleStateEvent(IdleState.READER_IDLE, first);
                     channelIdle(ctx, event);
                 } catch (Throwable t) {
@@ -558,6 +573,7 @@ public class IdleStateHandler extends ChannelDuplexHandler {
 
             long nextDelay = allIdleTimeNanos;
             if (!reading) {
+                // 当前事件 - 上次读写事件的最大值
                 nextDelay -= ticksInNanos() - Math.max(lastReadTime, lastWriteTime);
             }
             if (nextDelay <= 0) {
